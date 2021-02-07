@@ -31,6 +31,7 @@
 #include <QDebug>
 #include <iostream>
 #include <QProcess>
+#include <QTemporaryFile>
 #include <QDir>
 #include <QRegExp>
 #include <QSet>
@@ -54,11 +55,35 @@ bool runCodesign = false;
 QStringList librarySearchPath;
 QString codesignIdentiy;
 bool appstoreCompliant = false;
-int logLevel = 1;
+//int logLevel = 1; // error
+int logLevel = 3; // debug
 bool deployFramework = false;
 
 using std::cout;
 using std::endl;
+
+QString findTool(const QString &tool)
+{
+    static QString targetDir = qEnvironmentVariable("OSXCROSS_TARGET_DIR");
+    static QString host = qEnvironmentVariable("HOST");
+
+    if (targetDir.isEmpty() || host.isEmpty()) {
+        return tool;
+    }
+    else {
+        return targetDir + "/bin/" + host + "-" + tool;
+    }
+}
+
+void insertQtLibPathIfOsxcross(QSet<QString> &set)
+{
+    static QString targetDir = qEnvironmentVariable("OSXCROSS_TARGET_DIR");
+    static QString host = qEnvironmentVariable("HOST");
+    
+    if (!targetDir.isEmpty()) {
+        set.insert(targetDir + "/" + host + "/qt5/lib");
+    }
+}
 
 bool operator==(const FrameworkInfo &a, const FrameworkInfo &b)
 {
@@ -170,7 +195,7 @@ OtoolInfo findDependencyInfo(const QString &binaryPath)
     LogDebug() << "Using otool:";
     LogDebug() << " inspecting" << binaryPath;
     QProcess otool;
-    otool.start("otool", QStringList() << "-L" << binaryPath);
+    otool.start(findTool("otool"), QStringList() << "-L" << binaryPath);
     otool.waitForFinished();
 
     if (otool.exitStatus() != QProcess::NormalExit || otool.exitCode() != 0) {
@@ -380,7 +405,7 @@ QString findAppBinary(const QString &appBundlePath)
     QString binaryPath;
 
 #ifdef Q_OS_DARWIN
-    CFStringRef bundlePath = appBundlePath.toCFString();
+    CFStringRef bundlePath = QString_toCFString(appBundlePath);
     CFURLRef bundleURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault, bundlePath,
                                                        kCFURLPOSIXPathStyle, true);
     CFRelease(bundlePath);
@@ -393,7 +418,7 @@ QString findAppBinary(const QString &appBundlePath)
                 CFStringRef executablePath = CFURLCopyFileSystemPath(absoluteExecutableURL,
                                                                      kCFURLPOSIXPathStyle);
                 if (executablePath) {
-                    binaryPath = QString::fromCFString(executablePath);
+                    binaryPath = QString_fromCFString(executablePath);
                     CFRelease(executablePath);
                 }
                 CFRelease(absoluteExecutableURL);
@@ -403,6 +428,16 @@ QString findAppBinary(const QString &appBundlePath)
         CFRelease(bundle);
     }
     CFRelease(bundleURL);
+#else
+    QDir path(appBundlePath);
+    QString bn = path.dirName();
+    if (!bn.isNull()) {
+        int suffix = bn.lastIndexOf(".app");
+        if (suffix != -1) {
+            QString binPath = bn.mid(0, suffix);
+            binaryPath = (path.absolutePath() + "/Contents/MacOS/" + binPath);
+        }
+    }
 #endif
 
     if (QFile::exists(binaryPath))
@@ -516,7 +551,7 @@ QSet<QString> getBinaryRPaths(const QString &path, bool resolve = true, QString 
     QSet<QString> rpaths;
 
     QProcess otool;
-    otool.start("otool", QStringList() << "-l" << path);
+    otool.start(findTool("otool"), QStringList() << "-l" << path);
     otool.waitForFinished();
 
     if (otool.exitCode() != 0) {
@@ -559,6 +594,7 @@ QList<FrameworkInfo> getQtFrameworks(const QString &path, const QString &appBund
 
 QList<FrameworkInfo> getQtFrameworksForPaths(const QStringList &paths, const QString &appBundlePath, const QSet<QString> &rpaths, bool useDebugLibs)
 {
+
     QList<FrameworkInfo> result;
     QSet<QString> existing;
     foreach (const QString &path, paths) {
@@ -797,7 +833,7 @@ QString copyFramework(const FrameworkInfo &framework, const QString path)
 void runInstallNameTool(QStringList options)
 {
     QProcess installNametool;
-    installNametool.start("install_name_tool", options);
+    installNametool.start(findTool("install_name_tool"), options);
     installNametool.waitForFinished();
     if (installNametool.exitCode() != 0) {
         LogError() << installNametool.readAllStandardError();
@@ -897,7 +933,7 @@ void runStrip(const QString &binaryPath)
     LogDebug() << "Using strip:";
     LogDebug() << " stripped" << binaryPath;
     QProcess strip;
-    strip.start("strip", QStringList() << "-x" << binaryPath);
+    strip.start(findTool("strip"), QStringList() << "-x" << binaryPath);
     strip.waitForFinished();
     if (strip.exitCode() != 0) {
         LogError() << strip.readAllStandardError();
@@ -1013,6 +1049,7 @@ DeploymentInfo deployQtFrameworks(const QString &appBundlePath, const QStringLis
    QStringList allBinaryPaths = QStringList() << applicationBundle.binaryPath << applicationBundle.libraryPaths
                                                  << additionalExecutables;
    QSet<QString> allLibraryPaths = getBinaryRPaths(applicationBundle.binaryPath, true);
+   insertQtLibPathIfOsxcross(allLibraryPaths);
    allLibraryPaths.insert(QLibraryInfo::location(QLibraryInfo::LibrariesPath));
    QList<FrameworkInfo> frameworks = getQtFrameworksForPaths(allBinaryPaths, appBundlePath, allLibraryPaths, useDebugLibs);
    if (frameworks.isEmpty() && !alwaysOwerwriteEnabled) {
@@ -1151,6 +1188,8 @@ void deployPlugins(const ApplicationBundleInfo &appBundleInfo, const QString &pl
         }
     }
 
+    insertQtLibPathIfOsxcross(deploymentInfo.rpathsUsed);
+
     foreach (const QString &plugin, pluginList) {
         QString sourcePath = pluginSourcePath + "/" + plugin;
         const QString destinationPath = pluginDestinationPath + "/" + plugin;
@@ -1256,6 +1295,13 @@ bool deployQmlImports(const QString &appBundlePath, DeploymentInfo deploymentInf
         argumentList.append(qmlDir);
     }
     QString qmlImportsPath = QLibraryInfo::location(QLibraryInfo::Qml2ImportsPath);
+
+    static QString targetDir = qEnvironmentVariable("OSXCROSS_TARGET_DIR");
+    static QString host = qEnvironmentVariable("HOST");
+    if (!targetDir.isEmpty()) {
+        qmlImportsPath = targetDir + "/" + host + "/qt5/qml";
+    }
+
     argumentList.append( "-importPath");
     argumentList.append(qmlImportsPath);
 
@@ -1371,7 +1417,7 @@ void codesignFile(const QString &identity, const QString &filePath)
     LogNormal() << "codesign" << filePath;
 
     QProcess codesign;
-    codesign.start("codesign", QStringList() << "--preserve-metadata=identifier,entitlements"
+    codesign.start(findTool("codesign"), QStringList() << "--preserve-metadata=identifier,entitlements"
                                              << "--force" << "-s" << identity << filePath);
     codesign.waitForFinished(-1);
 
@@ -1502,7 +1548,7 @@ QSet<QString> codesignBundle(const QString &identity,
 
     // Verify code signature
     QProcess codesign;
-    codesign.start("codesign", QStringList() << "--deep" << "-v" << appBundlePath);
+    codesign.start(findTool("codesign"), QStringList() << "--deep" << "-v" << appBundlePath);
     codesign.waitForFinished(-1);
     QByteArray err = codesign.readAllStandardError();
     if (codesign.exitCode() > 0) {
@@ -1539,19 +1585,72 @@ void createDiskImage(const QString &appBundlePath, const QString &filesystemType
 
     LogNormal() << "Image will use" << filesystemType;
 
-    // More dmg options can be found in the hdiutil man page.
-    QStringList options = QStringList()
-            << "create" << dmgName
-            << "-srcfolder" << appBundlePath
-            << "-format" << "UDZO"
-            << "-fs" << filesystemType
-            << "-volname" << appBaseName;
+    static QString targetDir = qEnvironmentVariable("OSXCROSS_TARGET_DIR");
 
-    QProcess hdutil;
-    hdutil.start("hdiutil", options);
-    hdutil.waitForFinished(-1);
-    if (hdutil.exitCode() != 0) {
-        LogError() << "Bundle creation error:" << hdutil.readAllStandardError();
+    if (targetDir.isEmpty()) {
+        // Assume we're **NOT** crosscompiling: use hdiutil
+
+        // More dmg options can be found in the hdiutil man page.
+        QStringList options = QStringList()
+                << "create" << dmgName
+                << "-srcfolder" << appBundlePath
+                << "-format" << "UDZO"
+                << "-fs" << filesystemType
+                << "-volname" << appBaseName;
+
+        QProcess hdutil;
+        hdutil.start("hdiutil", options);
+        hdutil.waitForFinished(-1);
+        if (hdutil.exitCode() != 0) {
+            LogError() << "Bundle creation error:" << hdutil.readAllStandardError();
+        }
+    }
+    else {
+        QProcess proc;
+
+        proc.start("du", QStringList() << "-b" << "-s" << appBundlePath);
+        proc.waitForFinished(-1);
+        if (proc.exitCode() != 0) {
+            LogError() << "Bundle creation error: (du)" << proc.readAllStandardError();
+            return;
+        }
+
+        QString duOutput = QString::fromLatin1(proc.readAll());
+
+        bool intOk;
+        int dirSize = duOutput.split(QRegExp("\\s+"), QString::SkipEmptyParts)[0].toInt(&intOk);
+        if (!intOk) {
+            LogError() << "Bundle creation error: (du)" << proc.readAll();
+            return;
+        }
+
+        QFile destFile(dmgName);
+        destFile.open(QIODevice::NewOnly);
+        destFile.resize(dirSize
+                + Q_INT64_C(32) * Q_INT64_C(1048576));
+
+        QString destFilePath = QFileInfo(destFile).absoluteFilePath();
+
+        proc.start("mkfs.hfsplus", QStringList() << "-v" << appBaseName << destFilePath);
+        proc.waitForFinished(-1);
+        if (proc.exitCode() != 0) {
+            LogError() << "Bundle creation error: (mkfs.hfsplus)" << proc.readAllStandardError();
+            return;
+        }
+
+        proc.start("hfsplus", QStringList() << destFilePath << "mkdir" << appBundlePath);
+        proc.waitForFinished(-1);
+        if (proc.exitCode() != 0) {
+            LogError() << "Bundle creation error: (hfsplus)" << proc.readAllStandardError();
+            return;
+        }
+
+        proc.start("hfsplus", QStringList() << destFilePath << "addall" << appBundlePath << appBundlePath);
+        proc.waitForFinished(-1);
+        if (proc.exitCode() != 0) {
+            LogError() << "Bundle creation error: (hfsplus)" << proc.readAllStandardError();
+            return;
+        }
     }
 }
 

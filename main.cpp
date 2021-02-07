@@ -176,6 +176,9 @@ int main(int argc, char **argv)
             return 1;
         }
      }
+    
+    static QString targetDir = qEnvironmentVariable("OSXCROSS_TARGET_DIR");
+    static QString host = qEnvironmentVariable("HOST");
 
     DeploymentInfo deploymentInfo = deployQtFrameworks(appBundlePath, additionalExecutables, useDebugLibs);
 
@@ -205,7 +208,12 @@ int main(int argc, char **argv)
     }
 
     if (plugins && !deploymentInfo.qtPath.isEmpty()) {
-        deploymentInfo.pluginPath = deploymentInfo.qtPath + "/plugins";
+        if (!targetDir.isEmpty()) {
+            deploymentInfo.pluginPath = targetDir + "/" + host + "/qt5/plugins";
+        } else {
+            deploymentInfo.pluginPath = deploymentInfo.qtPath + "/plugins";
+        }
+        LogError() << deploymentInfo.pluginPath;
         LogNormal();
         deployPlugins(appBundlePath, deploymentInfo, useDebugLibs);
         createQtConf(appBundlePath);
