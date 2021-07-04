@@ -33,7 +33,6 @@
 #include <QProcess>
 #include <QTemporaryFile>
 #include <QDir>
-#include <QRegExp>
 #include <QSet>
 #include <QStack>
 #include <QDirIterator>
@@ -54,6 +53,9 @@ bool alwaysOwerwriteEnabled = false;
 bool runCodesign = false;
 QStringList librarySearchPath;
 QString codesignIdentiy;
+QString extraEntitlements;
+bool hardenedRuntime = false;
+bool secureTimestamp = false;
 bool appstoreCompliant = false;
 //int logLevel = 1; // error
 int logLevel = 3; // debug
@@ -64,24 +66,22 @@ using std::endl;
 
 QString findTool(const QString &tool)
 {
-    static QString targetDir = qEnvironmentVariable("OSXCROSS_TARGET_DIR");
     static QString host = qEnvironmentVariable("HOST");
 
     if (targetDir.isEmpty() || host.isEmpty()) {
         return tool;
     }
     else {
-        return targetDir + "/bin/" + host + "-" + tool;
+        return host + "-" + tool;
     }
 }
 
 void insertQtLibPathIfOsxcross(QSet<QString> &set)
 {
-    static QString targetDir = qEnvironmentVariable("OSXCROSS_TARGET_DIR");
-    static QString host = qEnvironmentVariable("HOST");
+    static QString qtDir = qEnvironmentVariable("QT_DIR");
     
-    if (!targetDir.isEmpty()) {
-        set.insert(targetDir + "/" + host + "/qt5/lib");
+    if (!qtDir.isEmpty()) {
+        set.insert(qtDir + "/lib");
     }
 }
 
@@ -205,10 +205,10 @@ OtoolInfo findDependencyInfo(const QString &binaryPath)
 
     static const QRegularExpression regexp(QStringLiteral(
         "^\\t(.+) \\(compatibility version (\\d+\\.\\d+\\.\\d+), "
-        "current version (\\d+\\.\\d+\\.\\d+)\\)$"));
+        "current version (\\d+\\.\\d+\\.\\d+)(, weak)?\\)$"));
 
     QString output = otool.readAllStandardOutput();
-    QStringList outputLines = output.split("\n", QString::SkipEmptyParts);
+    QStringList outputLines = output.split("\n", Qt::SkipEmptyParts);
     if (outputLines.size() < 2) {
         LogError() << "Could not parse otool output:" << output;
         return info;
@@ -218,13 +218,19 @@ OtoolInfo findDependencyInfo(const QString &binaryPath)
     if (binaryPath.contains(".framework/") || binaryPath.endsWith(".dylib")) {
         const auto match = regexp.match(outputLines.first());
         if (match.hasMatch()) {
-            info.installName = match.captured(1);
-            info.compatibilityVersion = QVersionNumber::fromString(match.captured(2));
-            info.currentVersion = QVersionNumber::fromString(match.captured(3));
+            QString installname = match.captured(1);
+            if (QFileInfo(binaryPath).fileName() == QFileInfo(installname).fileName()) {
+                info.installName = installname;
+                info.compatibilityVersion = QVersionNumber::fromString(match.captured(2));
+                info.currentVersion = QVersionNumber::fromString(match.captured(3));
+                outputLines.removeFirst();
+            } else {
+                info.installName = binaryPath;
+            }
         } else {
             LogError() << "Could not parse otool output line:" << outputLines.first();
+            outputLines.removeFirst();
         }
-        outputLines.removeFirst();
     }
 
     for (const QString &outputLine : outputLines) {
@@ -405,7 +411,7 @@ QString findAppBinary(const QString &appBundlePath)
     QString binaryPath;
 
 #ifdef Q_OS_DARWIN
-    CFStringRef bundlePath = QString_toCFString(appBundlePath);
+    CFStringRef bundlePath = appBundlePath.toCFString();
     CFURLRef bundleURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault, bundlePath,
                                                        kCFURLPOSIXPathStyle, true);
     CFRelease(bundlePath);
@@ -418,7 +424,7 @@ QString findAppBinary(const QString &appBundlePath)
                 CFStringRef executablePath = CFURLCopyFileSystemPath(absoluteExecutableURL,
                                                                      kCFURLPOSIXPathStyle);
                 if (executablePath) {
-                    binaryPath = QString_fromCFString(executablePath);
+                    binaryPath = QString::fromCFString(executablePath);
                     CFRelease(executablePath);
                 }
                 CFRelease(absoluteExecutableURL);
@@ -453,7 +459,8 @@ QStringList findAppFrameworkNames(const QString &appBundlePath)
     // populate the frameworks list with QtFoo.framework etc,
     // as found in /Contents/Frameworks/
     QString searchPath = appBundlePath + "/Contents/Frameworks/";
-    QDirIterator iter(searchPath, QStringList() << QString::fromLatin1("*.framework"), QDir::Dirs);
+    QDirIterator iter(searchPath, QStringList() << QString::fromLatin1("*.framework"),
+                      QDir::Dirs | QDir::NoSymLinks);    
     while (iter.hasNext()) {
         iter.next();
         frameworks << iter.fileInfo().fileName();
@@ -466,7 +473,8 @@ QStringList findAppFrameworkPaths(const QString &appBundlePath)
 {
     QStringList frameworks;
     QString searchPath = appBundlePath + "/Contents/Frameworks/";
-    QDirIterator iter(searchPath, QStringList() << QString::fromLatin1("*.framework"), QDir::Dirs);
+    QDirIterator iter(searchPath, QStringList() << QString::fromLatin1("*.framework"),
+                      QDir::Dirs | QDir::NoSymLinks);    
     while (iter.hasNext()) {
         iter.next();
         frameworks << iter.fileInfo().filePath();
@@ -480,8 +488,7 @@ QStringList findAppLibraries(const QString &appBundlePath)
     QStringList result;
     // dylibs
     QDirIterator iter(appBundlePath, QStringList() << QString::fromLatin1("*.dylib"),
-            QDir::Files, QDirIterator::Subdirectories);
-
+            QDir::Files | QDir::NoSymLinks, QDirIterator::Subdirectories);
     while (iter.hasNext()) {
         iter.next();
         result << iter.fileInfo().filePath();
@@ -504,6 +511,23 @@ QStringList findAppBundleFiles(const QString &appBundlePath, bool absolutePath =
     }
 
     return result;
+}
+
+QString findEntitlementsFile(const QString& path)
+{
+    QDirIterator iter(path, QStringList() << QString::fromLatin1("*.entitlements"),
+            QDir::Files, QDirIterator::Subdirectories);
+
+    while (iter.hasNext()) {
+        iter.next();
+        if (iter.fileInfo().isSymLink())
+            continue;
+
+        //return the first entitlements file - only one is used for signing anyway
+        return iter.fileInfo().absoluteFilePath();
+    }
+
+    return QString();
 }
 
 QList<FrameworkInfo> getQtFrameworks(const QList<DylibInfo> &dependencies, const QString &appBundlePath, const QSet<QString> &rpaths, bool useDebugLibs)
@@ -564,12 +588,11 @@ QSet<QString> getBinaryRPaths(const QString &path, bool resolve = true, QString 
 
     QString output = otool.readAllStandardOutput();
     QStringList outputLines = output.split("\n");
-    QStringListIterator i(outputLines);
 
-    while (i.hasNext()) {
-        if (i.next().contains("cmd LC_RPATH") && i.hasNext() &&
-        i.next().contains("cmdsize") && i.hasNext()) {
-            const QString &rpathCmd = i.next();
+    for (auto i = outputLines.cbegin(), end = outputLines.cend(); i != end; ++i) {
+        if (i->contains("cmd LC_RPATH") && ++i != end &&
+            i->contains("cmdsize") && ++i != end) {
+            const QString &rpathCmd = *i;
             int pathStart = rpathCmd.indexOf("path ");
             int pathEnd = rpathCmd.indexOf(" (");
             if (pathStart >= 0 && pathEnd >= 0 && pathStart < pathEnd) {
@@ -594,7 +617,6 @@ QList<FrameworkInfo> getQtFrameworks(const QString &path, const QString &appBund
 
 QList<FrameworkInfo> getQtFrameworksForPaths(const QStringList &paths, const QString &appBundlePath, const QSet<QString> &rpaths, bool useDebugLibs)
 {
-
     QList<FrameworkInfo> result;
     QSet<QString> existing;
     foreach (const QString &path, paths) {
@@ -1050,7 +1072,7 @@ DeploymentInfo deployQtFrameworks(const QString &appBundlePath, const QStringLis
                                                  << additionalExecutables;
    QSet<QString> allLibraryPaths = getBinaryRPaths(applicationBundle.binaryPath, true);
    insertQtLibPathIfOsxcross(allLibraryPaths);
-   allLibraryPaths.insert(QLibraryInfo::location(QLibraryInfo::LibrariesPath));
+   allLibraryPaths.insert(QLibraryInfo::path(QLibraryInfo::LibrariesPath));
    QList<FrameworkInfo> frameworks = getQtFrameworksForPaths(allBinaryPaths, appBundlePath, allLibraryPaths, useDebugLibs);
    if (frameworks.isEmpty() && !alwaysOwerwriteEnabled) {
         LogWarning();
@@ -1173,7 +1195,7 @@ void deployPlugins(const ApplicationBundleInfo &appBundleInfo, const QString &pl
 
     static const std::map<QString, std::vector<QString>> map {
         {QStringLiteral("Multimedia"), {QStringLiteral("mediaservice"), QStringLiteral("audio")}},
-        {QStringLiteral("3DRender"), {QStringLiteral("sceneparsers"), QStringLiteral("geometryloaders")}},
+        {QStringLiteral("3DRender"), {QStringLiteral("sceneparsers"), QStringLiteral("geometryloaders"), QStringLiteral("renderers")}},
         {QStringLiteral("3DQuickRender"), {QStringLiteral("renderplugins")}},
         {QStringLiteral("Positioning"), {QStringLiteral("position")}},
         {QStringLiteral("Location"), {QStringLiteral("geoservices")}},
@@ -1267,14 +1289,21 @@ static bool importLessThan(const QVariant &v1, const QVariant &v2)
 }
 
 // Scan qml files in qmldirs for import statements, deploy used imports from Qml2ImportsPath to Contents/Resources/qml.
-bool deployQmlImports(const QString &appBundlePath, DeploymentInfo deploymentInfo, QStringList &qmlDirs)
+bool deployQmlImports(const QString &appBundlePath, DeploymentInfo deploymentInfo, QStringList &qmlDirs, QStringList &qmlImportPaths)
 {
     LogNormal() << "";
     LogNormal() << "Deploying QML imports ";
-    LogNormal() << "Application QML file search path(s) is" << qmlDirs;
+    LogNormal() << "Application QML file path(s) is" << qmlDirs;
+    LogNormal() << "QML module search path(s) is" << qmlImportPaths;
 
     // Use qmlimportscanner from QLibraryInfo::BinariesPath
-    QString qmlImportScannerPath = QDir::cleanPath(QLibraryInfo::location(QLibraryInfo::BinariesPath) + "/qmlimportscanner");
+    QString qmlImportScannerPath
+    QString qtDir = qEnvironmentVariable("QT_DIR");
+    if (!qtDir.isEmpty()) {
+        qmlImportScannerPath = qtDir + "/bin/qmlimportscanner";
+    } else {
+        qmlImportScannerPath = QDir::cleanPath(QLibraryInfo::path(QLibraryInfo::BinariesPath) + "/qmlimportscanner");
+    }
 
     // Fallback: Look relative to the macdeployqt binary
     if (!QFile(qmlImportScannerPath).exists())
@@ -1294,12 +1323,11 @@ bool deployQmlImports(const QString &appBundlePath, DeploymentInfo deploymentInf
         argumentList.append("-rootPath");
         argumentList.append(qmlDir);
     }
-    QString qmlImportsPath = QLibraryInfo::location(QLibraryInfo::Qml2ImportsPath);
-
-    static QString targetDir = qEnvironmentVariable("OSXCROSS_TARGET_DIR");
-    static QString host = qEnvironmentVariable("HOST");
-    if (!targetDir.isEmpty()) {
-        qmlImportsPath = targetDir + "/" + host + "/qt5/qml";
+    for (const QString &importPath : qmlImportPaths)
+        argumentList << "-importPath" << importPath;
+    QString qmlImportsPath = QLibraryInfo::path(QLibraryInfo::Qml2ImportsPath);
+    if (!qtDir.isEmpty()) {
+        qmlImportsPath = qtDir + "/qml";
     }
 
     argumentList.append( "-importPath");
@@ -1336,7 +1364,7 @@ bool deployQmlImports(const QString &appBundlePath, DeploymentInfo deploymentInf
     // deployQmlImports can consider the module deployed if it has already
     // deployed one of its sub-module)
     QVariantList array = doc.array().toVariantList();
-    qSort(array.begin(), array.end(), importLessThan);
+    std::sort(array.begin(), array.end(), importLessThan);
 
     // deploy each import
     foreach (const QVariant &importValue, array) {
@@ -1377,48 +1405,31 @@ bool deployQmlImports(const QString &appBundlePath, DeploymentInfo deploymentInf
     return true;
 }
 
-void changeQtFrameworks(const QList<FrameworkInfo> frameworks, const QStringList &binaryPaths, const QString &absoluteQtPath)
-{
-    LogNormal() << "Changing" << binaryPaths << "to link against";
-    LogNormal() << "Qt in" << absoluteQtPath;
-    QString finalQtPath = absoluteQtPath;
-
-    if (!absoluteQtPath.startsWith("/Library/Frameworks"))
-        finalQtPath += "/lib/";
-
-    foreach (FrameworkInfo framework, frameworks) {
-        const QString oldBinaryId = framework.installName;
-        const QString newBinaryId = finalQtPath + framework.frameworkName +  framework.binaryPath;
-        foreach (const QString &binary, binaryPaths)
-            changeInstallName(oldBinaryId, newBinaryId, binary);
-    }
-}
-
-void changeQtFrameworks(const QString appPath, const QString &qtPath, bool useDebugLibs)
-{
-    const QString appBinaryPath = findAppBinary(appPath);
-    const QStringList libraryPaths = findAppLibraries(appPath);
-    const QList<FrameworkInfo> frameworks = getQtFrameworksForPaths(QStringList() << appBinaryPath << libraryPaths, appPath, getBinaryRPaths(appBinaryPath, true), useDebugLibs);
-    if (frameworks.isEmpty()) {
-        LogWarning();
-        LogWarning() << "Could not find any _external_ Qt frameworks to change in" << appPath;
-        return;
-    } else {
-        const QString absoluteQtPath = QDir(qtPath).absolutePath();
-        changeQtFrameworks(frameworks, QStringList() << appBinaryPath << libraryPaths, absoluteQtPath);
-    }
-}
-
 void codesignFile(const QString &identity, const QString &filePath)
 {
     if (!runCodesign)
         return;
 
-    LogNormal() << "codesign" << filePath;
+    QString codeSignLogMessage = "codesign";
+    if (hardenedRuntime)
+        codeSignLogMessage += ", enable hardened runtime";
+    if (secureTimestamp)
+        codeSignLogMessage += ", include secure timestamp";
+    LogNormal() << codeSignLogMessage << filePath;
+
+    QStringList codeSignOptions = { "--preserve-metadata=identifier,entitlements", "--force", "-s",
+                                    identity, filePath };
+    if (hardenedRuntime)
+        codeSignOptions << "-o" << "runtime";
+
+    if (secureTimestamp)
+        codeSignOptions << "--timestamp";
+
+    if (!extraEntitlements.isEmpty())
+        codeSignOptions << "--entitlements" << extraEntitlements;
 
     QProcess codesign;
-    codesign.start(findTool("codesign"), QStringList() << "--preserve-metadata=identifier,entitlements"
-                                             << "--force" << "-s" << identity << filePath);
+    codesign.start("codesign", codeSignOptions);
     codesign.waitForFinished(-1);
 
     QByteArray err = codesign.readAllStandardError();
@@ -1505,11 +1516,12 @@ QSet<QString> codesignBundle(const QString &identity,
             continue;
 
         // Check if there are unsigned dependencies, sign these first.
-        QStringList dependencies =
-                getBinaryDependencies(rootBinariesPath, binary, additionalBinariesContainingRpaths).toSet()
-                .subtract(signedBinaries)
-                .subtract(pendingBinariesSet)
-                .toList();
+        QStringList dependencies = getBinaryDependencies(rootBinariesPath, binary,
+                                                         additionalBinariesContainingRpaths);
+        dependencies = QSet<QString>(dependencies.begin(), dependencies.end())
+            .subtract(signedBinaries)
+            .subtract(pendingBinariesSet)
+            .values();
 
         if (!dependencies.isEmpty()) {
             pendingBinaries.push(binary);
@@ -1537,6 +1549,9 @@ QSet<QString> codesignBundle(const QString &identity,
                 continue;
             }
         }
+
+        // Look for an entitlements file in the bundle to include when signing
+        extraEntitlements = findEntitlementsFile(appBundleAbsolutePath + "/Contents/Resources/");
 
         // All dependencies are signed, now sign this binary.
         codesignFile(identity, binary);
@@ -1585,9 +1600,9 @@ void createDiskImage(const QString &appBundlePath, const QString &filesystemType
 
     LogNormal() << "Image will use" << filesystemType;
 
-    static QString targetDir = qEnvironmentVariable("OSXCROSS_TARGET_DIR");
+    static QString qtDir = qEnvironmentVariable("QT_DIR");
 
-    if (targetDir.isEmpty()) {
+    if (qtDir.isEmpty()) {
         // Assume we're **NOT** crosscompiling: use hdiutil
 
         // More dmg options can be found in the hdiutil man page.
