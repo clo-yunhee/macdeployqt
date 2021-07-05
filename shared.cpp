@@ -68,7 +68,7 @@ QString findTool(const QString &tool)
 {
     static QString host = qEnvironmentVariable("HOST");
 
-    if (targetDir.isEmpty() || host.isEmpty()) {
+    if (host.isEmpty()) {
         return tool;
     }
     else {
@@ -1012,7 +1012,7 @@ DeploymentInfo deployQtFrameworks(QList<FrameworkInfo> frameworks,
             deploymentInfo.isDebug = true;
 
         if (deploymentInfo.qtPath.isNull())
-            deploymentInfo.qtPath = QLibraryInfo::location(QLibraryInfo::PrefixPath);
+            deploymentInfo.qtPath = QLibraryInfo::path(QLibraryInfo::PrefixPath);
 
         if (framework.frameworkDirectory.startsWith(bundlePath)) {
             LogError()  << framework.frameworkName << "already deployed, skipping.";
@@ -1297,7 +1297,7 @@ bool deployQmlImports(const QString &appBundlePath, DeploymentInfo deploymentInf
     LogNormal() << "QML module search path(s) is" << qmlImportPaths;
 
     // Use qmlimportscanner from QLibraryInfo::BinariesPath
-    QString qmlImportScannerPath
+    QString qmlImportScannerPath;
     QString qtDir = qEnvironmentVariable("QT_DIR");
     if (!qtDir.isEmpty()) {
         qmlImportScannerPath = qtDir + "/bin/qmlimportscanner";
@@ -1633,7 +1633,7 @@ void createDiskImage(const QString &appBundlePath, const QString &filesystemType
         QString duOutput = QString::fromLatin1(proc.readAll());
 
         bool intOk;
-        int dirSize = duOutput.split(QRegExp("\\s+"), QString::SkipEmptyParts)[0].toInt(&intOk);
+        int dirSize = duOutput.split(QRegularExpression("\\s+"), Qt::SkipEmptyParts)[0].toInt(&intOk);
         if (!intOk) {
             LogError() << "Bundle creation error: (du)" << proc.readAll();
             return;
